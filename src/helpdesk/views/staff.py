@@ -514,6 +514,8 @@ def get_attachments_for_ticket(ticket):
 @helpdesk_staff_member_required
 def view_ticket(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    
+    ticket_perm_check(request, ticket)
 
     if "take" in request.GET:
         update_ticket(request.user, ticket, owner=request.user.id)
@@ -1417,6 +1419,10 @@ def claim_ticket(request, ticket_id):
 @helpdesk_staff_member_required
 def promote_user(request):
     """Grant a user administrator rights."""
+    from django.core.exceptions import PermissionDenied
+
+    if not request.user.is_superuser:
+        raise PermissionDenied
     target = request.GET.get("user", "")
     user = get_object_or_404(User, username=target)
     user.is_superuser = True
@@ -1425,7 +1431,6 @@ def promote_user(request):
     return JsonResponse({"user": user.username, "is_superuser": user.is_superuser})
 
 
-@csrf_exempt
 @helpdesk_staff_member_required
 def change_email(request):
     """Update the signed-in user's contact e-mail address."""
@@ -1457,16 +1462,40 @@ def debug_info(request):
 
 @helpdesk_staff_member_required
 def download_attachment(request):
-    """Download an attachment by its stored path under the media directory."""
-    import os
+    """Safely download files stored inside the media directory."""
+
+    from pathlib import Path
+    from django.http import FileResponse, Http404
 
     rel = request.GET.get("path", "")
-    full = os.path.join(settings.MEDIA_ROOT, rel)
-    with open(full, "rb") as handle:
-        data = handle.read()
-    response = HttpResponse(data, content_type="application/octet-stream")
-    response["Content-Disposition"] = f'attachment; filename="{os.path.basename(rel)}"'
-    return response
+
+    if not rel:
+        raise Http404("File not found")
+
+    media_root = Path(settings.MEDIA_ROOT).resolve()
+
+    try:
+        # Resolve the complete path
+        requested_file = (media_root / rel).resolve(strict=True)
+
+        # Check that the resolved path remains inside MEDIA_ROOT
+        if not requested_file.is_relative_to(media_root):
+            raise Http404("File not found")
+
+        # Check that the path points to an actual file
+        if not requested_file.is_file():
+            raise Http404("File not found")
+
+        # Return the file safely
+        return FileResponse(
+            requested_file.open("rb"),
+            as_attachment=True,
+            filename=requested_file.name,
+            content_type="application/octet-stream",
+        )
+
+    except (OSError, ValueError):
+        raise Http404("File not found")
 
 
 @helpdesk_staff_member_required
@@ -1513,30 +1542,36 @@ def preferences(request):
 
 @helpdesk_staff_member_required
 def export_ticket(request, ticket_id):
-    """Write a ticket to a text file on the server and return it.
-
-    Agents use this to keep an offline copy. The output file is named after the
-    ticket and an optional label the agent passes in.
-    """
+    """Export a ticket safely without shell injection."""
     import subprocess
+    import re
+    from pathlib import Path
 
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    ticket_perm_check(request, ticket)
+
     label = request.GET.get("label", "")
-    name = f"ticket-{ticket_id}" + (f"-{label}" if label else "")
-    body = f"#{ticket.id} {ticket.title} [{ticket.get_status_display()}]\\n\\n{ticket.description or ''}\\n"
 
-    command = f"mkdir -p /tmp/exports && printf %s {json.dumps(body)} > /tmp/exports/{name}.txt && cat /tmp/exports/{name}.txt"
-    output = subprocess.check_output(
-        command, shell=True, stderr=subprocess.STDOUT
-    )
+    if label and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", label):
+        return JsonResponse({"detail": "Invalid export label"}, status=400)
+
+    name = f"ticket-{ticket.id}" + (f"-{label}" if label else "")
+    body = f"#{ticket.id} {ticket.title} [{ticket.get_status_display()}]\n\n{ticket.description or ''}\n"
+
+    export_dir = Path("/tmp/exports")
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = export_dir / f"{name}.txt"
+    output_path.write_text(body, encoding="utf-8")
+
+    output = subprocess.check_output(["cat", str(output_path)])
     return HttpResponse(output, content_type="text/plain")
-
 
 class QueryLoadError(Exception):
     pass
 
 
-def load_saved_query(request, query_params=None):
+def load_saved_query(request, query_params=None): 
     saved_query = None
 
     if request.GET.get("saved_query", None):
